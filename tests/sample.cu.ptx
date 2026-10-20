@@ -1,0 +1,133 @@
+// A test PTX module, assembled to trip over the known traps:
+//   * vector registers %rs1 %rs2 separated by a space, not a comma
+//   * float constants as IEEE754 hex bit patterns (0f3F800000)
+//   * addresses of the form [%rd+64], [%rd], [%rd + %rq*4]
+//   * predicated instructions @%p and @!%p
+//   * branches with modifiers: bra.uni, call.uni, ret.uni
+//   * warp primitives: shfl.sync, vote.sync, ballot.sync
+//   * atomics and barriers
+//   * .param with arrays and .align
+// These are exactly the constructs naive PTX parsers break on.
+
+.version 7.5
+.target sm_80
+.address_size 64
+
+// ── reduction plus warp primitives: the most common pattern in real kernels ──
+.visible .entry warp_reduce_f32(
+    .param .u64 _param_0,          // input pointer
+    .param .u64 _param_1,          // output pointer
+    .param .u32 _param_2,          // n
+    .param .u32 _param_3,          // initial
+    .param .const .align 4 .b32 _param_4
+)
+.maxntid 1024, 1, 1
+{
+    .reg .pred      %p<3>;
+    .reg .b32       %r<8>;
+    .reg .f32       %f<8>;
+    .reg .b64       %rd<4>;
+    .reg .f32       %rs<4>;
+
+    ld.param.u64    %rd1, [_param_0];
+    ld.param.u64    %rd2, [_param_1];
+    ld.param.u32    %r1,  [_param_2];
+    ld.param.u32    %r2,  [_param_3];
+
+    mov.u32         %r3, %tid.x;
+    setp.ge.u32     %p1, %r3, %r1;
+    @%p1 bra       DONE;
+
+    // ── warp sum with shuffle-down ──
+    mul.lo.u32      %r4, %r3, 4;
+    add.s64         %rd3, %rd1, %rd4;      // %rd4 is not defined yet, see below
+    mov.f32         %f1, 0f00000000;
+
+    shfl.sync.down.b32 %r5, %r3, 16, 0x1f;
+    shfl.sync.down.b32 %r6, %r3, 8,  0x1f;
+    shfl.sync.down.b32 %r7, %r3, 4,  0x1f;
+
+    // ── vector store: 4 floats in one register ──
+    mov.v4.f32      {%f1, %f2, %f3, %f4}, {%f5, %f6, %f7, %f8};
+    st.global.v4.f32 [%rd2], {%f1, %f2, %f3, %f4};
+
+    // ── vector load through a register pair (space, not comma) ──
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd2];
+
+    // ── predicated add with an inversion ──
+    setp.lt.f32     %p2, %f1, 0f3F800000;
+    @!%p2 add.f32   %f1, %f1, %f2;
+    @%p2 mul.f32    %f3, %f3, 0f40000000;
+
+    // ── vector add of 8 floats from two v4 registers ──
+    add.v2.f32      %rs1, %rs2, %rs3;
+    add.v4.f32      %rs4, %rs5, %rs6;
+
+    // ── extended arithmetic: exp/log/sqrt/fma ──
+    ex2.approx.f32  %f5, %f1;
+    lg2.approx.f32  %f6, %f2;
+    sqrt.rn.f32     %f7, %f3;
+    rsqrt.approx.f32 %f8, %f4;
+    sin.approx.f32  %f5, %f5;
+    fma.rn.f32      %f6, %f7, %f8, %f1;
+
+    // ── vote and ballot ──
+    vote.sync.ballot.b32 %r8, %p2;
+    ballot.sync.b32  %r8, %p1;
+    setp.eq.u32      %p3, %r8, 0;
+
+    // ── atomic operation ──
+    atom.global.add.f32 %f1, [%rd2], %f2;
+    red.global.add.f32 [%rd2], %f2;
+
+    // ── barrier ──
+    bar.sync 0;
+    bar.warp.sync 0;
+
+    // ── branch on a predicate with a label ──
+    @%p3 bra       SKIP;
+    setp.eq.u32    %p1, %r1, 0;
+    bra.uni        SKIP;
+
+SKIP:
+    ret.uni;
+DONE:
+    ret.uni;
+}
+
+// ── external function declaration: no body ──
+.extern .func  _ZN7FermiE9extensionE(
+    .param .u64 %value
+);
+
+// ── block with explicit shared memory sizes and a constant load ──
+.visible .entry reduce_shared(
+    .param .u64 input,
+    .param .u32 n,
+    .param .u32 smem
+)
+.maxntid 256, 1, 1
+{
+    .reg .b32   %r<6>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+    .reg .f32   %fs<2>;
+
+    mov.u32       %r1, %ctaid.x;
+    mov.u32       %r2, %tid.x;
+    mov.u32       %r3, %ntid.x;
+    mov.u32       %r4, %laneid;
+    mov.u32       %r5, %warpid;
+
+    st.shared.f32 [%r2], %f1;
+    ld.shared.f32 %f2, [%r2];
+    ld.const.f32 %f3, [param_0];
+
+    bar.sync 0;
+
+    // An external function call
+    mov.u64       %rd1, 0;
+    call.uni      (%rd2), _ZN7FermiE9extensionE, %rd1;
+
+    ret.uni;
+}

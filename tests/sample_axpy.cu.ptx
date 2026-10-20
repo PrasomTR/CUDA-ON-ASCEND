@@ -1,0 +1,162 @@
+// PTX sample used to check the own path.
+//
+// The same text serves the direct backend test and the CUDA Driver API
+// interception test. Duplicating it in two places is not allowed: a change
+// to one copy would make a green test prove nothing about the other.
+//
+// axpy semantics: y[i] = a*x[i] + b, plus a checksum a*x[0] + b in element 0
+// of the out buffer. The references in the tests (verify_nvidia,
+// verify_ascend, test_intercept) compute exactly that.
+.version 7.0
+.target sm_37
+.address_size 64
+
+.visible .entry axpy(
+    .param .u64 x_ptr,
+    .param .u64 y_ptr,
+    .param .u32 n,
+    .param .f32 a,
+    .param .f32 b,
+    .param .u64 out_ptr
+)
+.maxntid 64, 1, 1
+{
+    .reg .pred  %p<4>;
+    .reg .b32   %r<12>;
+    .reg .f32   %f<8>;
+    .reg .b64   %rd<8>;
+
+    ld.param.u64  %rd1, [x_ptr];
+    ld.param.u64  %rd2, [y_ptr];
+    ld.param.u64  %rd3, [out_ptr];
+    ld.param.u32  %r1,  [n];
+    ld.param.f32  %f1,  [a];
+    ld.param.f32  %f2,  [b];
+
+    mov.u32  %r2, %tid.x;
+    // An exit condition, not an entry one: a thread with index >= n does no work.
+    // The direction matters here — an inverted condition (tid < n) turns the
+    // kernel into a no-op and no thread writes anything.
+    setp.ge.u32 %p1, %r2, %r1;
+    @%p1 bra  EXIT;
+
+    mul.lo.u32 %r3, %r2, 4;
+    cvt.s64.s32 %rd4, %r3;
+    add.s64   %rd5, %rd1, %rd4;
+    ld.global.f32 %f3, [%rd5];
+
+    mul.f32  %f4, %f3, %f1;
+    add.f32  %f5, %f4, %f2;
+
+    add.s64   %rd6, %rd2, %rd4;
+    st.global.f32 [%rd6], %f5;
+
+    // A checksum through lane 0: it checks that the guard and the store work
+    // together without needing any exchange between threads.
+    mov.u32   %r9, %laneid;
+    setp.eq.u32 %p2, %r9, 0;
+    @%p2 st.global.f32 [%rd3], %f5;
+
+EXIT:
+    ret.uni;
+}
+
+.visible .entry axpy_reduce(
+    .param .u64 x_ptr,
+    .param .u64 y_ptr,
+    .param .u32 n,
+    .param .f32 a,
+    .param .f32 b,
+    .param .u64 out_ptr
+)
+.maxntid 64, 1, 1
+{
+    .reg .pred  %p<4>;
+    .reg .b32   %r<12>;
+    .reg .f32   %f<8>;
+    .reg .b64   %rd<8>;
+
+    ld.param.u64  %rd1, [x_ptr];
+    ld.param.u64  %rd2, [y_ptr];
+    ld.param.u64  %rd3, [out_ptr];
+    ld.param.u32  %r1,  [n];
+    ld.param.f32  %f1,  [a];
+    ld.param.f32  %f2,  [b];
+
+    mov.u32  %r2, %tid.x;
+    // An exit condition, not an entry one: a thread with index >= n does no work.
+    // The direction matters here — an inverted condition (tid < n) turns the
+    // kernel into a no-op and no thread writes anything.
+    setp.ge.u32 %p1, %r2, %r1;
+    @%p1 bra  EXIT;
+
+    mul.lo.u32 %r3, %r2, 4;
+    cvt.s64.s32 %rd4, %r3;
+    add.s64   %rd5, %rd1, %rd4;
+    ld.global.f32 %f3, [%rd5];
+
+    mul.f32  %f4, %f3, %f1;
+    add.f32  %f5, %f4, %f2;
+
+    add.s64   %rd6, %rd2, %rd4;
+    st.global.f32 [%rd6], %f5;
+
+    mov.b32   %r4, %f5;
+    shfl.down.b32 %r5, %r4, 16, 0x1f;
+    shfl.down.b32 %r6, %r5,  8, 0x1f;
+    shfl.down.b32 %r7, %r6,  4, 0x1f;
+    shfl.down.b32 %r8, %r7,  1, 0x1f;
+    mov.f32   %f6, %r8;
+
+    bar.sync 0;
+
+    mov.u32   %r9, %laneid;
+    setp.eq.u32 %p2, %r9, 0;
+    @%p2 st.global.f32 [%rd3], %f6;
+
+EXIT:
+    ret.uni;
+}
+
+// Elementwise kernel the way a real program launches it: a global index
+// built from %ctaid.x, a guard that leaves the tail untouched, and a grid
+// of several blocks. Used to check that a grid launch lowers correctly.
+.visible .entry scale_grid(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .f32 c
+)
+.maxntid 256, 1, 1
+{
+    .reg .pred  %p<2>;
+    .reg .b32   %r<8>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<6>;
+
+    ld.param.u64  %rd1, [in_ptr];
+    ld.param.u64  %rd2, [out_ptr];
+    ld.param.u32  %r1,  [n];
+    ld.param.f32  %f1,  [c];
+
+    // index = ctaid.x * ntid.x + tid.x
+    mov.u32  %r2, %ctaid.x;
+    mov.u32  %r3, %ntid.x;
+    mul.lo.u32 %r4, %r2, %r3;
+    mov.u32  %r5, %tid.x;
+    add.u32  %r6, %r4, %r5;
+
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra EXIT;
+
+    mul.lo.u32 %r7, %r6, 4;
+    cvt.s64.s32 %rd3, %r7;
+    add.s64   %rd4, %rd1, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    mul.f32   %f3, %f2, %f1;
+    add.s64   %rd5, %rd2, %rd3;
+    st.global.f32 [%rd5], %f3;
+
+EXIT:
+    ret.uni;
+}
