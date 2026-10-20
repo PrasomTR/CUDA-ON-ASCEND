@@ -1,0 +1,24 @@
+/* Only the intercepted cuBLAS symbols are exported. */
+
+{
+    global:
+        cublasCreate_v2;
+        cublasDestroy_v2;
+        cublasSetStream_v2;
+        cublasGetStream_v2;
+        cublasSgemm;
+        cublasDgemm;
+        cublasHgemm;
+        cublasGetVersion_v2;
+        cublasSetPointerMode;
+        cublasGetPointerMode;
+        cublasSaxpy;
+        cublasDaxpy;
+        cublasSscal;
+        cublasDscal;
+        cublasSgemv;
+        cublasDgemv;
+        cublasSetMathMode;
+    local:
+        *;
+};
